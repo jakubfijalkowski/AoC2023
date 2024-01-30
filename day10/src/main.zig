@@ -20,6 +20,10 @@ const Pos = struct {
     fn eq(self: Pos, other: Pos) bool {
         return self.x == other.x and self.y == other.y;
     }
+
+    fn isValid(self: Pos, p: *const Painted) bool {
+        return self.x >= 0 and self.y >= 0 and self.x < p.width and self.y < p.height;
+    }
 };
 
 const PosPair = struct {
@@ -82,18 +86,18 @@ const Field = enum {
 
 const Line = ArrayList(Field);
 
-const Distances = struct {
+const Pattern = struct {
     width: usize,
     height: usize,
     dists: []i32,
     allocator: Allocator,
 
-    fn make(maze: *const Maze, allocator: Allocator) !Distances {
+    fn make(maze: *const Maze, allocator: Allocator) !Pattern {
         var height = maze.map.items.len;
         var width = maze.map.items[0].items.len;
         var dists = try allocator.alloc(i32, width * height);
         @memset(dists, -1);
-        return Distances{
+        return Pattern{
             .width = width,
             .height = height,
             .dists = dists,
@@ -101,8 +105,8 @@ const Distances = struct {
         };
     }
 
-    fn update(self: *Distances, p: Pos, d: i32) i32 {
-        var idx = @as(usize, @intCast(p.y)) * self.height + @as(usize, @intCast(p.x));
+    fn update(self: *Pattern, p: Pos, d: i32) i32 {
+        var idx = @as(usize, @intCast(p.y)) * self.width + @as(usize, @intCast(p.x));
         if (self.dists[idx] == -1) {
             self.dists[idx] = d;
             return d;
@@ -113,7 +117,50 @@ const Distances = struct {
         }
     }
 
-    fn deinit(self: *const Distances) void {
+    fn at(self: *const Pattern, p: Pos) i32 {
+        var idx = @as(usize, @intCast(p.y)) * self.width + @as(usize, @intCast(p.x));
+        return self.dists[idx];
+    }
+
+    fn paint(self: *Pattern, maze: *Maze) i32 {
+        const start = maze.findStart();
+        var curr = PosPair.mk(start, start);
+        var next = maze.replaceStart(start);
+
+        var result: i32 = 0;
+        var i: i32 = 0;
+        while (!next.a.eq(start) and !next.b.eq(start)) : (i += 1) {
+            const part1Len = self.update(curr.a, i);
+            const part2Len = self.update(curr.b, i);
+            result = @max(part1Len, result);
+            result = @max(part2Len, result);
+
+            var newNext = PosPair.mk(maze.at(next.a).next(curr.a, next.a), maze.at(next.b).next(curr.b, next.b));
+            curr = next;
+            next = newNext;
+
+            if (part1Len < result and part2Len < result) {
+                break;
+            }
+        }
+        return result;
+    }
+
+    fn print(self: *const Pattern) void {
+        for (0..self.height) |y| {
+            for (0..self.width) |x| {
+                var v = self.at(Pos{ .x = @intCast(x), .y = @intCast(y) });
+                if (v >= 0) {
+                    std.debug.print("#", .{});
+                } else {
+                    std.debug.print(".", .{});
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+    }
+
+    fn deinit(self: *const Pattern) void {
         self.allocator.free(self.dists);
     }
 };
@@ -203,6 +250,137 @@ const Maze = struct {
     }
 };
 
+const Painted = struct {
+    width: usize,
+    height: usize,
+    pattern: []bool,
+    allocator: Allocator,
+
+    fn prepare(maze: *const Maze, allocator: Allocator) !Painted {
+        var height = maze.map.items.len;
+        var width = maze.map.items[0].items.len;
+        var pattern = try allocator.alloc(bool, width * 2 * height * 2);
+
+        return Painted{
+            .width = width * 2,
+            .height = height * 2,
+            .pattern = pattern,
+            .allocator = allocator,
+        };
+    }
+
+    fn paint(self: *Painted, pat: *const Pattern, maze: *const Maze) void {
+        for (0..pat.height) |y| {
+            for (0..pat.width) |x| {
+                const p = Pos{ .x = @intCast(x), .y = @intCast(y) };
+                if (pat.at(p) >= 0) {
+                    self.pattern[self.idx(x * 2, y * 2)] = true;
+
+                    const f = maze.at(p);
+                    switch (f) {
+                        Field.Vertical => {
+                            self.pattern[self.idx(x * 2, y * 2 + 1)] = true;
+                        },
+                        Field.Horizontal => {
+                            self.pattern[self.idx(x * 2 + 1, y * 2)] = true;
+                        },
+                        Field.NorthEast => {
+                            self.pattern[self.idx(x * 2 + 1, y * 2)] = true;
+                        },
+                        Field.SouthWest => {
+                            self.pattern[self.idx(x * 2, y * 2 + 1)] = true;
+                        },
+                        Field.SouthEast => {
+                            self.pattern[self.idx(x * 2 + 1, y * 2)] = true;
+                            self.pattern[self.idx(x * 2, y * 2 + 1)] = true;
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
+
+    fn idx(self: *const Painted, x: usize, y: usize) usize {
+        return y * self.width + x;
+    }
+
+    fn idxPos(self: *const Painted, p: Pos) usize {
+        return @as(usize, @intCast(p.y)) * self.width + @as(usize, @intCast(p.x));
+    }
+
+    fn floodFill(self: *Painted) !void {
+        var toVisit = ArrayList(Pos).init(self.allocator);
+        defer toVisit.deinit();
+
+        for (0..self.height) |y| {
+            if (!self.pattern[self.idx(0, y)]) {
+                try toVisit.append(Pos{ .x = 0, .y = @intCast(y) });
+            }
+
+            if (!self.pattern[self.idx(self.width - 1, y)]) {
+                try toVisit.append(Pos{ .x = @intCast(self.width - 1), .y = @intCast(y) });
+            }
+        }
+
+        for (0..self.width) |x| {
+            if (!self.pattern[self.idx(x, 0)]) {
+                try toVisit.append(Pos{ .x = @intCast(x), .y = 0 });
+            }
+
+            if (!self.pattern[self.idx(x, self.height - 1)]) {
+                try toVisit.append(Pos{ .x = @intCast(x), .y = @intCast(self.height - 1) });
+            }
+        }
+
+        while (toVisit.popOrNull()) |p| {
+            if (!p.isValid(self)) {
+                continue;
+            }
+
+            var i = self.idxPos(p);
+            if (!self.pattern[i]) {
+                self.pattern[i] = true;
+
+                try toVisit.append(p.move(-1, 0));
+                try toVisit.append(p.move(1, 0));
+                try toVisit.append(p.move(0, -1));
+                try toVisit.append(p.move(0, 1));
+            }
+        }
+    }
+
+    fn calcInside(self: *const Painted) i32 {
+        var result: i32 = 0;
+        for (0..self.height / 2) |y| {
+            for (0..self.width / 2) |x| {
+                if (!self.pattern[self.idx(x * 2, y * 2)] and !self.pattern[self.idx(x * 2 + 1, y * 2)] and !self.pattern[self.idx(x * 2, y * 2 + 1)] and !self.pattern[self.idx(x * 2 + 1, y * 2 + 1)]) {
+                    result += 1;
+                }
+            }
+        }
+        return result;
+    }
+
+    fn print(self: *const Painted) void {
+        for (0..self.height) |y| {
+            for (0..self.width) |x| {
+                var v = self.pattern[self.idx(x, y)];
+                if (v) {
+                    std.debug.print("#", .{});
+                } else {
+                    std.debug.print(".", .{});
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+    }
+
+    fn deinit(self: *const Painted) void {
+        self.allocator.free(self.pattern);
+    }
+};
+
 pub fn part1() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer assert(gpa.deinit() == .ok);
@@ -213,28 +391,36 @@ pub fn part1() !void {
     var maze = try Maze.parseFile(file, allocator);
     defer maze.deinit();
 
-    var dists = try Distances.make(&maze, allocator);
-    defer dists.deinit();
+    var pat = try Pattern.make(&maze, allocator);
+    defer pat.deinit();
 
-    const start = maze.findStart();
-    var curr = PosPair.mk(start, start);
-    var next = maze.replaceStart(start);
-
-    var result: i32 = 0;
-    var i: i32 = 0;
-    while (!next.a.eq(start) and !next.b.eq(start)) : (i += 1) {
-        result = @max(dists.update(curr.a, i), result);
-        result = @max(dists.update(curr.b, i), result);
-
-        var newNext = PosPair.mk(maze.at(next.a).next(curr.a, next.a), maze.at(next.b).next(curr.b, next.b));
-        curr = next;
-        next = newNext;
-    }
+    const result = pat.paint(&maze);
 
     std.debug.print("Part 1: {}\n", .{result});
 }
 
-pub fn part2() !void {}
+pub fn part2() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    const file = try std.fs.cwd().openFile("data.txt", .{});
+    defer file.close();
+    var maze = try Maze.parseFile(file, allocator);
+    defer maze.deinit();
+
+    var pat = try Pattern.make(&maze, allocator);
+    defer pat.deinit();
+    _ = pat.paint(&maze);
+
+    var painted = try Painted.prepare(&maze, allocator);
+    defer painted.deinit();
+
+    painted.paint(&pat, &maze);
+    try painted.floodFill();
+
+    std.debug.print("Part 1: {}\n", .{painted.calcInside()});
+}
 
 pub fn main() !void {
     try part1();

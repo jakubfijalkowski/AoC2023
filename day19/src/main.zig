@@ -48,8 +48,9 @@ const Action = union(ActionType) {
     }
 };
 
+const RangeResult = struct { newRange: RatingRange, action: Action };
 const RuleType = enum { noCondition, greaterThan, lessThan };
-const RulePayload = struct { value: u32, prop: Category, action: Action };
+const RulePayload = struct { value: u64, prop: Category, action: Action };
 const Rule = union(RuleType) {
     noCondition: Action,
     greaterThan: RulePayload,
@@ -63,7 +64,7 @@ const Rule = union(RuleType) {
             };
         } else {
             var prop = Category.parse(data[0..1]);
-            var value = try parseInt(u32, data[2..colon.?], 10);
+            var value = try parseInt(u64, data[2..colon.?], 10);
             var action = Action.parse(data[(colon.? + 1)..]);
             var payload = RulePayload{ .value = value, .prop = prop, .action = action };
             if (data[1] == '<') {
@@ -81,8 +82,24 @@ const Rule = union(RuleType) {
     fn run(self: *const Rule, data: *const Rating) ?Action {
         return switch (self.*) {
             .noCondition => |c| c,
-            .greaterThan => |*c| if (data.get(c.*.prop) > c.*.value) c.*.action else null,
-            .lessThan => |*c| if (data.get(c.*.prop) < c.*.value) c.*.action else null,
+            .greaterThan => |*c| if (data.get(c.prop) > c.value) c.action else null,
+            .lessThan => |*c| if (data.get(c.prop) < c.value) c.action else null,
+        };
+    }
+
+    fn take(self: *const Rule, r: RatingRange) RangeResult {
+        return switch (self.*) {
+            .noCondition => |c| RangeResult{ .newRange = r, .action = c },
+            .greaterThan => |*c| RangeResult{ .newRange = r.update(c.prop, r.get(c.prop).cutBottom(c.value + 1)), .action = c.action },
+            .lessThan => |*c| RangeResult{ .newRange = r.update(c.prop, r.get(c.prop).cutTop(c.value - 1)), .action = c.action },
+        };
+    }
+
+    fn dontTake(self: *const Rule, r: RatingRange) ?RatingRange {
+        return switch (self.*) {
+            .noCondition => |_| null,
+            .greaterThan => |*c| r.update(c.prop, r.get(c.prop).cutTop(c.value)),
+            .lessThan => |*c| r.update(c.prop, r.get(c.prop).cutBottom(c.value)),
         };
     }
 };
@@ -155,6 +172,41 @@ const Workflows = struct {
         };
     }
 
+    fn simulate(self: *const Workflows) u64 {
+        return self.simulateSingle("in", 0, RatingRange.initial());
+    }
+
+    fn simulateSingle(self: *const Workflows, current: []const u8, ruleNum: usize, r: RatingRange) u64 {
+        if (r.size() == 0) {
+            return 0;
+        }
+
+        const workflow: *const Workflow = self.workflows.getPtr(current).?;
+        const rule = workflow.rules.items[ruleNum];
+
+        var result: u64 = 0;
+
+        var falsePart = rule.dontTake(r);
+        if (falsePart != null) {
+            result = self.simulateSingle(current, ruleNum + 1, falsePart.?);
+        }
+
+        var truePart = rule.take(r);
+        switch (truePart.action) {
+            .reject => {
+                result += 0;
+            },
+            .accept => {
+                result += truePart.newRange.size();
+            },
+            .proceed => |n| {
+                result += self.simulateSingle(n, 0, truePart.newRange);
+            },
+        }
+
+        return result;
+    }
+
     fn deinit(self: *Workflows) void {
         for (self.workflows.values()) |w| {
             w.deinit();
@@ -164,10 +216,10 @@ const Workflows = struct {
 };
 
 const Rating = struct {
-    x: u32,
-    m: u32,
-    a: u32,
-    s: u32,
+    x: u64,
+    m: u64,
+    a: u64,
+    s: u64,
 
     fn parse(line: []const u8) !Rating {
         var parts = splitAny(u8, line[1 .. line.len - 1], ",");
@@ -179,11 +231,11 @@ const Rating = struct {
         };
     }
 
-    fn parseSingle(data: []const u8) !u32 {
-        return try parseInt(u32, data[2..], 10);
+    fn parseSingle(data: []const u8) !u64 {
+        return try parseInt(u64, data[2..], 10);
     }
 
-    fn get(self: *const Rating, prop: Category) u32 {
+    fn get(self: *const Rating, prop: Category) u64 {
         return switch (prop) {
             Category.x => self.x,
             Category.m => self.m,
@@ -192,8 +244,81 @@ const Rating = struct {
         };
     }
 
-    fn sum(self: *const Rating) u32 {
+    fn sum(self: *const Rating) u64 {
         return self.x + self.m + self.a + self.s;
+    }
+};
+
+const Range = struct {
+    from: u64,
+    to: u64,
+
+    fn initial() Range {
+        return Range{ .from = 1, .to = 4000 };
+    }
+
+    fn isValid(rr: Range) bool {
+        return rr.from <= rr.to;
+    }
+
+    fn size(rr: Range) u64 {
+        return rr.to - rr.from + 1;
+    }
+
+    fn cutTop(rr: Range, newTo: u64) Range {
+        return Range{ .from = rr.from, .to = newTo };
+    }
+
+    fn cutBottom(rr: Range, newFrom: u64) Range {
+        return Range{ .from = newFrom, .to = rr.to };
+    }
+};
+
+const RatingRange = struct {
+    x: Range,
+    m: Range,
+    a: Range,
+    s: Range,
+
+    fn initial() RatingRange {
+        return RatingRange{
+            .x = Range.initial(),
+            .m = Range.initial(),
+            .a = Range.initial(),
+            .s = Range.initial(),
+        };
+    }
+
+    fn size(rr: *const RatingRange) u64 {
+        return rr.x.size() * rr.m.size() * rr.a.size() * rr.s.size();
+    }
+
+    fn get(self: *const RatingRange, prop: Category) Range {
+        return switch (prop) {
+            Category.x => self.x,
+            Category.m => self.m,
+            Category.a => self.a,
+            Category.s => self.s,
+        };
+    }
+
+    fn update(self: *const RatingRange, prop: Category, r: Range) RatingRange {
+        var copy = self.*;
+        switch (prop) {
+            Category.x => {
+                copy.x = r;
+            },
+            Category.m => {
+                copy.m = r;
+            },
+            Category.a => {
+                copy.a = r;
+            },
+            Category.s => {
+                copy.s = r;
+            },
+        }
+        return copy;
     }
 };
 
@@ -225,14 +350,18 @@ const Game = struct {
         };
     }
 
-    fn run(self: *const Game) u32 {
-        var result: u32 = 0;
+    fn run(self: *const Game) u64 {
+        var result: u64 = 0;
         for (self.ratings.items) |r| {
             if (self.workflows.run(&r) == Result.accept) {
                 result += r.sum();
             }
         }
         return result;
+    }
+
+    fn simulate(self: *const Game) u64 {
+        return self.workflows.simulate();
     }
 
     fn deinit(self: *Game) void {
@@ -266,6 +395,8 @@ pub fn part2() !void {
 
     var g = try Game.parseFile(file, allocator);
     defer g.deinit();
+
+    std.debug.print("Part 2: {}\n", .{g.simulate()});
 }
 
 pub fn main() !void {
